@@ -30,6 +30,7 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from agent.turn_persistence import persist_turn_transcript
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -455,7 +456,16 @@ def finalize_turn(
             except Exception as _mc_err:
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
-        agent._persist_session(messages, conversation_history)
+        _persist_err = persist_turn_transcript(
+            agent,
+            messages,
+            conversation_history,
+            successful_turn=bool(completed and not interrupted and not failed),
+            logger=logger,
+            log_context="finalize_turn",
+        )
+        if _persist_err is not None:
+            raise _persist_err
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)

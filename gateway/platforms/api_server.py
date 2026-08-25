@@ -1477,6 +1477,42 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+class _RunTerminalArbiter:
+    """Thread-safe winner selection for stop, persistence, and terminal output."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stop_requested = False
+        self._successful_turn_persisted = False
+        self._successful_turn_persistence_failed = False
+
+    def request_stop(self) -> bool:
+        with self._lock:
+            if self._successful_turn_persisted:
+                return False
+            self._stop_requested = True
+            return True
+
+    def record_persistence(self, *, succeeded: bool, successful_turn: bool) -> None:
+        with self._lock:
+            if not successful_turn:
+                return
+            if succeeded:
+                self._successful_turn_persisted = True
+            else:
+                self._successful_turn_persistence_failed = True
+
+    def terminal_for(self, *, failed: bool) -> str:
+        with self._lock:
+            if failed or self._successful_turn_persistence_failed:
+                return "failed"
+            if self._successful_turn_persisted:
+                return "completed"
+            if self._stop_requested:
+                return "cancelled"
+            return "completed"
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -1558,6 +1594,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
+        self._run_terminal_arbiters: Dict[str, _RunTerminalArbiter] = {}
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
@@ -3392,6 +3429,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_submission": True,
                 "run_status": True,
                 "run_events_sse": True,
+                "runs_session_history": True,
                 "run_stop": True,
                 "run_steer": True,
                 "run_approval_response": True,
@@ -4259,6 +4297,82 @@ class APIServerAdapter(BasePlatformAdapter):
         if not session:
             return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
         return session, None
+
+    async def _conversation_history_for_runs_session(
+        self, session_id: str
+    ) -> tuple[
+        List[Dict[str, Any]], Optional[tuple[Any, str]], Optional["web.Response"]
+    ]:
+        """Fail-fast acquire the durable lease, then load canonical history."""
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return [], None, web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
+        holder = f"pid={os.getpid()}:api-run-preflight={uuid.uuid4().hex}"
+        acquire_task = asyncio.create_task(
+            asyncio.to_thread(
+                db.acquire_session_turn_lease,
+                session_id,
+                holder,
+                ttl_seconds=300.0,
+                wait_seconds=0.0,
+            )
+        )
+        try:
+            # Keep the worker alive long enough to observe and release a lease
+            # acquired concurrently with request cancellation.
+            acquired = await asyncio.shield(acquire_task)
+        except asyncio.CancelledError:
+            acquired = False
+            with suppress(Exception):
+                acquired = await asyncio.shield(acquire_task)
+            if acquired:
+                with suppress(Exception):
+                    await asyncio.to_thread(
+                        db.release_session_turn_lease, session_id, holder
+                    )
+            raise
+        try:
+            if not acquired:
+                return [], None, web.json_response(
+                    _openai_error("Session is busy", code="session_turn_lease_busy"),
+                    status=409,
+                    headers={"Retry-After": "1"},
+                )
+            history = await asyncio.to_thread(
+                db.get_messages_as_conversation,
+                session_id,
+                repair_alternation=True,
+                include_row_ids=True,
+            )
+            return history, (db, holder), None
+        except asyncio.CancelledError:
+            if acquired:
+                with suppress(Exception):
+                    await asyncio.to_thread(
+                        db.release_session_turn_lease, session_id, holder
+                    )
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Failed to load canonical run history for %s: %s",
+                session_id,
+                exc,
+            )
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    db.release_session_turn_lease, session_id, holder
+                )
+            return [], None, web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
 
     async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
         db = await self._ensure_session_db_async()
@@ -7616,6 +7730,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         instructions = body.get("instructions")
+        previous_response_id_provided = "previous_response_id" in body
         previous_response_id = body.get("previous_response_id")
 
         # Accept explicit conversation_history from the request body.
@@ -7623,7 +7738,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]] = []
         conversation_history_provided = "conversation_history" in body
         raw_history = body.get("conversation_history")
-        if raw_history:
+        if conversation_history_provided:
             if not isinstance(raw_history, list):
                 return web.json_response(
                     _openai_error("'conversation_history' must be an array of message objects"),
@@ -7636,11 +7751,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         status=400,
                     )
                 conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
-            if previous_response_id:
+            if previous_response_id_provided:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         stored_session_id = None
-        if not conversation_history and previous_response_id:
+        if not conversation_history_provided and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
@@ -7648,10 +7763,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 if instructions is None:
                     instructions = stored.get("instructions")
 
-        # When input is a multi-message array, extract all but the last
-        # message as conversation history (the last becomes user_message).
-        # Only fires when no explicit history was provided.
-        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+        # A legacy multi-message input is itself a caller-owned history
+        # source, even if malformed/empty entries project to no messages.
+        legacy_history_provided = isinstance(raw_input, list) and len(raw_input) > 1
+        if (
+            not conversation_history_provided
+            and not previous_response_id_provided
+            and legacy_history_provided
+        ):
             for msg in raw_input[:-1]:
                 if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
                     content = msg["content"]
@@ -7664,20 +7783,48 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         requested_session_id = body.get("session_id")
-        if (
-            not conversation_history_provided
-            and not conversation_history
-            and requested_session_id
-        ):
+        canonical_session_history = False
+        preacquired_turn_lease = None
+        caller_history_provided = False
+        if "session_id" in body:
             requested_session_id, session_id_err = self._parse_session_continuation_id(
                 requested_session_id
             )
             if session_id_err is not None:
                 return session_id_err
-            if requested_session_id:
-                conversation_history = await self._conversation_history_for_session(
-                    requested_session_id
+            if not requested_session_id:
+                return web.json_response(
+                    _openai_error("Invalid session ID", code="invalid_session_id"),
+                    status=400,
                 )
+            if requested_session_id:
+                try:
+                    _, missing_session_err = await self._get_existing_session_or_404(
+                        requested_session_id
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to look up canonical run session %s: %s",
+                        requested_session_id,
+                        exc,
+                    )
+                    return web.json_response(
+                        _openai_error(
+                            "Session database unavailable",
+                            code="session_db_unavailable",
+                        ),
+                        status=503,
+                    )
+                if missing_session_err is not None:
+                    return missing_session_err
+
+            caller_history_provided = (
+                conversation_history_provided
+                or previous_response_id_provided
+                or legacy_history_provided
+            )
+            if requested_session_id and not caller_history_provided:
+                canonical_session_history = True
 
         session_id = requested_session_id or stored_session_id
         route = self._resolve_route(body.get("model"))
@@ -7692,7 +7839,18 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        if canonical_session_history:
+            (
+                conversation_history,
+                preacquired_turn_lease,
+                history_error,
+            ) = await self._conversation_history_for_runs_session(session_id)
+            if history_error is not None:
+                return history_error
+
         run_id = f"run_{uuid.uuid4().hex}"
+        terminal_arbiter = _RunTerminalArbiter()
+        self._run_terminal_arbiters[run_id] = terminal_arbiter
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -7750,6 +7908,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         async def _run_and_close():
+            agent = None
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
@@ -7777,6 +7936,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                     )
                 self._active_run_agents[run_id] = agent
+                agent._turn_persistence_callback = terminal_arbiter.record_persistence
+                if canonical_session_history:
+                    agent._turn_persist_retry_attempts = 2
+                if caller_history_provided:
+                    agent._preserve_caller_history_after_lease_wait = True
+                if preacquired_turn_lease is not None:
+                    preacquired_db, preacquired_holder = preacquired_turn_lease
+                    agent._preacquired_session_turn_lease = (
+                        preacquired_db,
+                        session_id,
+                        preacquired_holder,
+                    )
+                    # Test doubles do not execute AIAgent's adoption prologue;
+                    # expose the same holder at the persistence guard seam.
+                    agent._active_session_turn_lease_holder = preacquired_holder
+                    agent._active_session_turn_lease_ttl_seconds = 300.0
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
@@ -7884,7 +8059,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-                if run_id in self._stopping_run_ids:
+                structured_failure = isinstance(result, dict) and bool(
+                    result.get("failed")
+                )
+                terminal_outcome = terminal_arbiter.terminal_for(
+                    failed=structured_failure
+                )
+                if terminal_outcome == "cancelled":
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
@@ -7898,7 +8079,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
-                elif isinstance(result, dict) and result.get("failed"):
+                elif terminal_outcome == "failed":
                     error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
                     _put_event_if_active({
                         "event": "run.failed",
@@ -8005,6 +8186,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     unregister_gateway_notify(approval_session_key)
                 except Exception:
                     pass
+                if preacquired_turn_lease is not None:
+                    preacquired_db, preacquired_holder = preacquired_turn_lease
+                    with suppress(Exception):
+                        await asyncio.to_thread(
+                            preacquired_db.release_session_turn_lease,
+                            session_id,
+                            preacquired_holder,
+                        )
+                if agent is not None:
+                    for turn_attr in (
+                        "_turn_persistence_callback",
+                        "_turn_persist_retry_attempts",
+                        "_preacquired_session_turn_lease",
+                        "_preserve_caller_history_after_lease_wait",
+                    ):
+                        agent.__dict__.pop(turn_attr, None)
                 # Sentinel: signal SSE stream to close
                 try:
                     _put_event_if_active(None)
@@ -8262,6 +8459,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
+        arbiter = self._run_terminal_arbiters.get(run_id)
+        if arbiter is not None and not arbiter.request_stop():
+            return web.json_response(
+                {"run_id": run_id, "status": "completing", "accepted": False}
+            )
+
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
 
@@ -8328,6 +8531,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_terminal_arbiters.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

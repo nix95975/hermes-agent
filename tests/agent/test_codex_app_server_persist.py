@@ -2,25 +2,20 @@
 exactly once.
 
 The codex app-server runtime (``run_codex_app_server_turn``) is an early-return
-path that bypasses ``conversation_loop`` and therefore never runs the loop's
-per-step ``_persist_session()`` flushes. Before the fix, the projected
-assistant/tool messages were persisted *nowhere* (state.db got only
-session_meta rows), leaving ``session_search`` (FTS) and conversation-distill
-blind to real gateway conversations.
+path that bypasses ``conversation_loop`` and therefore must enter the shared
+marker-aware turn-persistence seam itself. Successful projected output must be
+persisted exactly once, while failed or interrupted projection must be dropped.
 
-The fix has the codex runtime flush its own projected messages via
-``_flush_messages_to_session_db()`` (idempotent through the intrinsic
-``_DB_PERSISTED_MARKER``) and return ``agent_persisted=True`` so the gateway
-skips its own ``append_to_transcript`` DB write. This is critical: the inbound
-user turn is already flushed at turn start (``turn_context._persist_session``),
-and ``append_message`` is a raw INSERT with no dedup — a gateway re-write would
-duplicate the user turn (#860 / #42039). This test locks in:
+The inbound user turn is already flushed at turn start
+(``turn_context._persist_session``), and a gateway raw re-write would duplicate
+it (#860 / #42039). These tests lock in:
 
-1. ``run_codex_app_server_turn`` flushes projected messages and returns
-   ``agent_persisted=True``.
-2. Exactly-once persistence: the already-flushed user turn is NOT re-written,
-   and the new projected assistant message lands once.
-3. The gateway resolution expression preserves standard-runtime behaviour.
+1. Successful Codex projection is persisted through the shared seam and the
+   result returns ``agent_persisted=True``.
+2. Failed, thrown, and interrupted turns persist only the safe inbound state.
+3. The already-flushed user turn is not re-written, while successful projected
+   assistant output lands once.
+4. The gateway resolution expression preserves standard-runtime behaviour.
 """
 
 import tempfile
@@ -61,20 +56,80 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     return agent
 
 
-def test_codex_success_flushes_and_reports_persisted():
-    """Codex success turn must self-persist and return agent_persisted=True."""
-    agent = _make_agent(session_db=None)  # no DB -> flush is a no-op, still True
-    result = run_codex_app_server_turn(
+def _run(agent, messages=None):
+    return run_codex_app_server_turn(
         agent,
         user_message="hello",
         original_user_message="hello",
-        messages=[{"role": "user", "content": "hello"}],
+        messages=messages or [{"role": "user", "content": "hello"}],
         effective_task_id="task-1",
     )
+
+
+def test_codex_success_persists_once_and_reports_callback_success():
+    """A successful Codex turn uses the common persistence contract once."""
+    agent = _make_agent(session_db=SimpleNamespace())
+    callbacks = []
+    agent._persist_session = MagicMock(return_value=None)
+    agent._turn_persistence_callback = lambda **kwargs: callbacks.append(kwargs)
+
+    result = _run(agent)
+
+    assert result["completed"] is True
+    assert result.get("failed") is not True
+    assert result["agent_persisted"] is True
+    agent._persist_session.assert_called_once()
+    persisted_messages = agent._persist_session.call_args.args[0]
+    assert [message["content"] for message in persisted_messages] == [
+        "hello",
+        "CODEX_ASSISTANT",
+    ]
+    assert callbacks == [{"succeeded": True, "successful_turn": True}]
+
+
+def test_codex_no_db_keeps_success_and_reports_callback_success():
+    """No-DB persistence remains a successful no-op, as on the normal path."""
+    agent = _make_agent(session_db=None)
+    callbacks = []
+    agent._persist_session = MagicMock(return_value=None)
+    agent._turn_persistence_callback = lambda **kwargs: callbacks.append(kwargs)
+
+    result = _run(agent)
+
     assert result["completed"] is True
     assert isinstance(result["messages"][-1]["timestamp"], float)
-    # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
+    assert callbacks == [{"succeeded": True, "successful_turn": True}]
+
+
+def test_codex_false_flush_retries_then_fails_closed_with_callback():
+    """An authoritative False flush is retried and cannot report completion."""
+    agent = _make_agent(session_db=SimpleNamespace(flush_token_counts=lambda: None))
+    agent._turn_persist_retry_attempts = 2
+    agent._session_persist_lock = None
+    agent._persist_disabled = False
+    agent._inflight_turn_id = "turn-1"
+    agent._inflight_turn_session_id = agent.session_id
+    agent._drop_trailing_empty_response_scaffolding = MagicMock()
+    agent._save_session_log = MagicMock()
+    agent._flush_messages_to_session_db = MagicMock(return_value=False)
+    agent._persist_session = AIAgent._persist_session.__get__(agent, AIAgent)
+    callbacks = []
+    agent._turn_persistence_callback = lambda **kwargs: callbacks.append(kwargs)
+
+    result = _run(agent)
+
+    assert agent._flush_messages_to_session_db.call_count == 2
+    assert callbacks == [{"succeeded": False, "successful_turn": True}]
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["agent_persisted"] is True
+    assert result["error"]
+    assert result["failure_reason"].startswith("session_persistence_failed:")
+    assert [message["content"] for message in result["messages"]] == [
+        "hello",
+        "CODEX_ASSISTANT",
+    ]
 
 
 def test_codex_user_interrupt_is_reported_and_cleared():
@@ -164,6 +219,115 @@ def test_codex_turn_persists_each_message_exactly_once():
         import shutil
 
         shutil.rmtree(tmp)
+
+
+def _make_real_db_agent(tmp_path, session_id):
+    db = SessionDB(tmp_path / f"{session_id}.db")
+    db.create_session(session_id=session_id, source="api_server", model="codex")
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        session_db=db,
+        session_id=session_id,
+    )
+    agent._session_db_created = True
+    agent._codex_session = MagicMock()
+    agent.tool_progress_callback = None
+    user_message = {"role": "user", "content": "DURABLE_USER"}
+    messages = [user_message]
+    agent._flush_messages_to_session_db(messages)
+    return db, agent, messages
+
+
+def test_codex_returned_error_discards_projected_output_in_real_db(tmp_path):
+    db, agent, messages = _make_real_db_agent(tmp_path, "returned-error")
+    callbacks = []
+    agent._turn_persistence_callback = lambda **kwargs: callbacks.append(kwargs)
+    turn = _make_turn()
+    turn.error = "codex timed out"
+    turn.final_text = "FAILED_PARTIAL"
+    turn.projected_messages = [
+        {
+            "role": "assistant",
+            "content": "FAILED_PARTIAL",
+            "tool_calls": [{
+                "id": "failed-call",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "failed-call", "content": "FAILED_TOOL"},
+    ]
+    agent._codex_session.run_turn.return_value = turn
+
+    result = _run(agent, messages)
+
+    assert result["completed"] is False
+    assert result["partial"] is True
+    assert result["failed"] is True
+    assert result["error"] == "codex timed out"
+    assert result["failure_reason"] == "codex_turn_error"
+    assert result["agent_persisted"] is True
+    assert [message["content"] for message in result["messages"]] == ["DURABLE_USER"]
+    assert callbacks == [{"succeeded": True, "successful_turn": False}]
+    assert [row["content"] for row in db.get_messages("returned-error")] == [
+        "DURABLE_USER"
+    ]
+    db.close()
+
+
+def test_codex_thrown_exception_persists_safe_state_once_in_real_db(tmp_path):
+    db, agent, messages = _make_real_db_agent(tmp_path, "thrown-error")
+    callbacks = []
+    agent._turn_persistence_callback = lambda **kwargs: callbacks.append(kwargs)
+    agent._codex_session.run_turn.side_effect = RuntimeError("codex crashed")
+
+    result = _run(agent, messages)
+
+    assert result["completed"] is False
+    assert result["partial"] is True
+    assert result["failed"] is True
+    assert result["error"] == "codex crashed"
+    assert result["failure_reason"] == "codex_turn_exception"
+    assert result["agent_persisted"] is True
+    assert callbacks == [{"succeeded": True, "successful_turn": False}]
+    assert [row["content"] for row in db.get_messages("thrown-error")] == [
+        "DURABLE_USER"
+    ]
+    db.close()
+
+
+def test_codex_interruption_discards_projected_output_in_real_db(tmp_path):
+    db, agent, messages = _make_real_db_agent(tmp_path, "interrupted-turn")
+    callbacks = []
+    agent._turn_persistence_callback = lambda **kwargs: callbacks.append(kwargs)
+    turn = _make_turn()
+    turn.interrupted = True
+    turn.final_text = "INTERRUPTED_PARTIAL"
+    turn.projected_messages = [
+        {"role": "assistant", "content": "INTERRUPTED_PARTIAL"}
+    ]
+    agent._codex_session.run_turn.return_value = turn
+    agent._interrupt_requested = True
+    agent._interrupt_message = "stop now"
+
+    result = _run(agent, messages)
+
+    assert result["completed"] is False
+    assert result["partial"] is True
+    assert result["interrupted"] is True
+    assert result["interrupt_message"] == "stop now"
+    assert result.get("failed") is not True
+    assert result["agent_persisted"] is True
+    assert [message["content"] for message in result["messages"]] == ["DURABLE_USER"]
+    assert callbacks == [{"succeeded": True, "successful_turn": False}]
+    assert [row["content"] for row in db.get_messages("interrupted-turn")] == [
+        "DURABLE_USER"
+    ]
+    db.close()
 
 
 class TestGatewayPersistedResolution:

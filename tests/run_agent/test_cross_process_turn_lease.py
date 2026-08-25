@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -125,6 +126,84 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
         and "loading the latest transcript" in text
         for kind, text in status_events
     )
+
+
+def test_caller_owned_history_survives_real_durable_lease_contention(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "caller-history.db"
+    owner_db = SessionDB(path)
+    agent_db = SessionDB(path)
+    session_id = owner_db.create_session("caller-history", "test")
+    owner_db.append_message(session_id, "user", "canonical private history")
+    holder = f"pid={os.getpid()}:turn=owner"
+    assert owner_db.try_acquire_session_turn_lease(
+        session_id, holder, ttl_seconds=30
+    )
+
+    agent = _agent_with_db(agent_db, session_id=session_id)
+    agent._preserve_caller_history_after_lease_wait = True
+    waiting = threading.Event()
+    agent.status_callback = lambda _kind, text=None: (
+        waiting.set() if text and "waiting for it to finish" in text else None
+    )
+    supplied = [{"role": "user", "content": "explicit caller history"}]
+    observed = {}
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        observed["history"] = history
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+    outcome = {}
+    worker = threading.Thread(
+        target=lambda: outcome.setdefault(
+            "result",
+            AIAgent.run_conversation(
+                agent, "new message", conversation_history=supplied
+            ),
+        )
+    )
+    worker.start()
+    assert waiting.wait(timeout=3)
+    owner_db.release_session_turn_lease(session_id, holder)
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert outcome["result"]["final_response"] == "ok"
+    assert observed["history"] is supplied
+    assert not hasattr(agent, "_preserve_caller_history_after_lease_wait")
+    owner_db.close()
+    agent_db.close()
+
+
+def test_run_conversation_adopts_preacquired_turn_lease(monkeypatch):
+    db = _DB()
+    agent = _agent_with_db(db)
+    holder = "pid=123:turn=api-preflight"
+    agent._preacquired_session_turn_lease = (db, "stale-parent", holder)
+    agent._turn_persist_retry_attempts = 2
+    agent._turn_persistence_callback = lambda **_kwargs: None
+    observed = {}
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        observed["history"] = history
+        observed["holder"] = _agent._active_session_turn_lease_holder
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+    supplied = [{"role": "user", "content": "loaded under preflight lease"}]
+
+    result = AIAgent.run_conversation(
+        agent, "new message", conversation_history=supplied
+    )
+
+    assert result["final_response"] == "ok"
+    assert observed == {"history": supplied, "holder": holder}
+    assert [event[0] for event in db.events] == ["release"]
+    assert not hasattr(agent, "_preacquired_session_turn_lease")
+    assert not hasattr(agent, "_turn_persist_retry_attempts")
+    assert not hasattr(agent, "_turn_persistence_callback")
 
 
 def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):

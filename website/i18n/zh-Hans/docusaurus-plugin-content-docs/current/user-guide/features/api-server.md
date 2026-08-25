@@ -214,6 +214,7 @@ OpenAI Responses API 格式。通过 `previous_response_id` 支持服务端对�
     "run_submission": true,
     "run_status": true,
     "run_events_sse": true,
+    "runs_session_history": true,
     "run_stop": true
   }
 }
@@ -246,7 +247,7 @@ OpenAI Responses API 格式。通过 `previous_response_id` 支持服务端对�
 }
 ```
 
-Runs 接受简单的 `input` 字符串，以及可选的 `session_id`、`instructions`、`conversation_history` 或 `previous_response_id`。当提供 `session_id` 时，Hermes 会在 run 状态中暴露它，以便外部 UI 将 run 与自己的对话 ID 关联。
+Runs 接受简单的 `input` 字符串，以及可选的 `session_id`、`instructions`、`conversation_history` 或 `previous_response_id`。请求体中的 `session_id` 是服务端拥有的连续性键，而不是客户端自定义标签：它必须标识一个已存在的 API session，并且需要 Bearer 认证。当调用方只发送这个稳定的 `session_id` 和当前输入时，Hermes 会从 `state.db` 加载历史，并在成功后持久化当前用户消息及权威的 assistant/tool transcript，因此适配器或进程重启后也无需重发 `conversation_history`。缺失的 session 返回 `404 session_not_found`；并发的权威 session turn 会立即返回 `409 session_turn_lease_busy`，客户端可在当前 turn 结束后重试。显式 `conversation_history`（包括 `[]`）、任何 `previous_response_id`（包括未知 ID）以及旧式多消息 `input` 都被视为调用方提供的历史来源，并抑制数据库回退。客户端可通过 `GET /v1/capabilities` 中的 `features.runs_session_history` 检测此能力。
 
 ### GET /v1/runs/\{run_id\}
 

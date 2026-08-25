@@ -442,7 +442,7 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 }
 ```
 
-Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs.
+Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. A body `session_id` is a server-owned continuity key, not a client-defined label: it must identify an existing API session and requires bearer authentication. When the caller sends only that stable `session_id` plus the current input, Hermes loads the session transcript from `state.db`; after a successful run it persists the current user turn and the authoritative assistant/tool transcript, so the next run can continue after an adapter or process restart without resending `conversation_history`. A missing session returns `404 session_not_found`; a concurrent canonical turn returns immediate `409 session_turn_lease_busy`, and the client can retry after the active turn finishes. Explicit `conversation_history` (including `[]`), any `previous_response_id` (including an unknown ID), and legacy multi-message `input` remain caller-owned history sources and suppress this database fallback. Clients can feature-detect this contract through `features.runs_session_history` in `GET /v1/capabilities`.
 
 ### GET /v1/runs/\{run_id\}
 

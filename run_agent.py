@@ -2042,13 +2042,25 @@ class AIAgent:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
-            # Drain async token-accounting deltas at every persist point (turn
-            # finalize + error exits) so a crash after this line loses at most
-            # the in-flight API call's delta. Cheap no-op when nothing queued.
-            if self._session_db is not None:
-                self._session_db.flush_token_counts()
+            transcript_flush = self._flush_messages_to_session_db(
+                messages, conversation_history
+            )
+            # ``None`` means durable transcript persistence is disabled or no
+            # SessionDB is available by design. ``False`` means the authoritative
+            # DB batch was attempted and failed; let the finalizer retry.
+            if transcript_flush is False:
+                raise RuntimeError("Session transcript persistence failed")
             note_turn_persisted(self)
+            # Token accounting is post-commit bookkeeping. A failure here must
+            # not relabel an already durable transcript as failed.
+            if self._session_db is not None:
+                try:
+                    self._session_db.flush_token_counts()
+                except Exception:
+                    logger.warning(
+                        "Token-accounting flush failed after transcript persist",
+                        exc_info=True,
+                    )
 
         if persist_lock is None:
             _persist_and_drain()
@@ -8632,9 +8644,24 @@ class AIAgent:
                 # prologue. We just proved this row exists, so suppress the
                 # redundant create attempt after acquiring it.
                 self._session_db_created = True
+                _preacquired = getattr(
+                    self, "_preacquired_session_turn_lease", None
+                )
+                _using_preacquired = (
+                    isinstance(_preacquired, tuple)
+                    and len(_preacquired) == 3
+                    and _preacquired[0] is _turn_db
+                    and _preacquired[1] == session_id
+                    and isinstance(_preacquired[2], str)
+                    and bool(_preacquired[2])
+                )
                 _durable_holder = (
-                    f"pid={os.getpid()}:turn={relay_turn_id}:platform="
-                    f"{task_context['platform'] or 'unknown'}"
+                    _preacquired[2]
+                    if _using_preacquired
+                    else (
+                        f"pid={os.getpid()}:turn={relay_turn_id}:platform="
+                        f"{task_context['platform'] or 'unknown'}"
+                    )
                 )
                 _lease_ttl = 300.0
                 _lease_waited = False
@@ -8653,7 +8680,7 @@ class AIAgent:
                             f"this session ({int(elapsed)}s)..."
                         )
 
-                if not _turn_db.acquire_session_turn_lease(
+                if not _using_preacquired and not _turn_db.acquire_session_turn_lease(
                     session_id,
                     _durable_holder,
                     ttl_seconds=_lease_ttl,
@@ -8730,18 +8757,19 @@ class AIAgent:
                 durable_turn_lease = _durable_holder
                 self._active_session_turn_lease_holder = _durable_holder
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
+                if _using_preacquired:
+                    delattr(self, "_preacquired_session_turn_lease")
                 if _lease_waited:
                     self._emit_status(
                         "Session is free; loading the latest transcript..."
                     )
 
                 # The holder may have compressed and rotated the session while
-                # this process waited. Resolve and reload only AFTER admission;
-                # a caller-provided in-memory snapshot is necessarily stale.
-                # Skip when acquisition was immediate — no other process held
-                # the lease, so the in-memory history is current and reloading
-                # would only cause an unnecessary prompt cache miss.
-                if _lease_waited:
+                # this process waited. Canonical reload is correct only for an
+                # agent-owned snapshot; explicit caller history retains priority.
+                if _lease_waited and not getattr(
+                    self, "_preserve_caller_history_after_lease_wait", False
+                ):
                     latest_session_id = _turn_db.resolve_resume_session_id(session_id)
                     if latest_session_id:
                         self.session_id = latest_session_id
@@ -8969,6 +8997,13 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    for _turn_attr in (
+                        "_turn_persistence_callback",
+                        "_turn_persist_retry_attempts",
+                        "_preacquired_session_turn_lease",
+                        "_preserve_caller_history_after_lease_wait",
+                    ):
+                        self.__dict__.pop(_turn_attr, None)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

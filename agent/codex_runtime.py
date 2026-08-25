@@ -768,6 +768,12 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    # The inbound user state was flushed before this early-return runtime was
+    # entered.  Keep an explicit safe projection so failed/interrupted Codex
+    # output can never become part of the transcript handed to persistence.
+    _safe_messages = list(messages)
+    from agent.turn_persistence import persist_turn_transcript
+
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
@@ -789,6 +795,13 @@ def run_codex_app_server_turn(
         )
         if _user_interrupted:
             agent.clear_interrupt()
+        persist_turn_transcript(
+            agent,
+            _safe_messages,
+            successful_turn=False,
+            logger=logger,
+            log_context="codex app-server failed turn",
+        )
         return {
             "final_response": (
                 f"Codex app-server turn failed: {exc}. "
@@ -805,6 +818,9 @@ def run_codex_app_server_turn(
                 else {}
             ),
             "error": str(exc),
+            "failed": True,
+            "failure_reason": "codex_turn_exception",
+            "agent_persisted": True,
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
@@ -838,47 +854,36 @@ def run_codex_app_server_turn(
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
-    if turn.projected_messages:
+    _successful_codex_turn = not turn.interrupted and turn.error is None
+    if _successful_codex_turn and turn.projected_messages:
         from agent.message_metadata import append_message
 
         for projected_message in turn.projected_messages:
             append_message(messages, projected_message)
 
-        # Persist the newly-projected assistant/tool messages ourselves.
-        # This path is an early return that bypasses conversation_loop, whose
-        # normal per-step _persist_session() calls would otherwise flush them.
-        # The inbound user turn was already flushed at turn start
-        # (turn_context.py _persist_session), and _flush_messages_to_session_db
-        # is idempotent via the intrinsic _DB_PERSISTED_MARKER — so this writes
-        # ONLY the new codex projected rows and does NOT re-write the user turn.
-        # Keeping the agent as the sole persister lets us return
-        # agent_persisted=True below, so the gateway skips its own DB write and
-        # we avoid the #860/#42039 duplicate user-message write (append_message
-        # is a raw INSERT with no dedup, so a gateway re-write would duplicate
-        # the already-flushed user turn). See gateway/run.py agent_persisted.
-        if getattr(agent, "_session_db", None) is not None:
-            try:
-                _codex_flush_ok = agent._flush_messages_to_session_db(messages)
-            except Exception:
-                _codex_flush_ok = False
-                logger.warning(
-                    "codex app-server projected-message flush failed",
-                    exc_info=True,
-                )
-            if _codex_flush_ok is False:
-                # Unlike the chat-completions loop (which fails closed BEFORE
-                # projection — see conversation_loop session_persistence_failed),
-                # codex output has already streamed to the user by the time this
-                # flush runs, so there is nothing left to withhold. We cannot
-                # flip agent_persisted=False either: the gateway fallback write
-                # would re-INSERT the already-flushed user turn (#860/#42039).
-                # Surface the durability gap loudly instead of a silent debug.
-                logger.warning(
-                    "codex app-server turn was delivered but could NOT be "
-                    "persisted to the session DB (session=%s) — this turn "
-                    "will be missing after restart/resume",
-                    getattr(agent, "session_id", None),
-                )
+    # This early-return runtime must enter the same marker-aware persistence
+    # contract as the standard finalizer. The inbound user row was already
+    # flushed at turn start; _persist_session's intrinsic markers therefore
+    # project only the newly appended Codex rows on every retry. Do not call the
+    # raw flush in addition to this seam: that would create a competing
+    # transcript projection and drift from the finalizer's callback contract.
+    _codex_persist_err = persist_turn_transcript(
+        agent,
+        messages if _successful_codex_turn else _safe_messages,
+        successful_turn=_successful_codex_turn,
+        logger=logger,
+        log_context="codex app-server turn",
+    )
+    _codex_persistence_failed = bool(
+        _successful_codex_turn and _codex_persist_err is not None
+    )
+    if _codex_persistence_failed:
+        logger.error(
+            "codex app-server successful turn could not be persisted after "
+            "retries (session=%s): %s",
+            getattr(agent, "session_id", None),
+            _codex_persist_err,
+        )
 
 
     # Counter ticks for the agent-improvement loop.
@@ -908,7 +913,7 @@ def run_codex_app_server_turn(
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if _successful_codex_turn and not _codex_persistence_failed:
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
@@ -925,6 +930,7 @@ def run_codex_app_server_turn(
     if (
         turn.final_text
         and not turn.interrupted
+        and not _codex_persistence_failed
         and (should_review_memory or should_review_skills)
     ):
         try:
@@ -936,30 +942,59 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    _persistence_cause = getattr(agent, "_last_persistence_error_cause", None)
+    if _persistence_cause not in {
+        "locked", "compression", "turn_lease", "corrupt", "disk", "unknown"
+    }:
+        _persistence_cause = "unknown"
+    _persistence_error_text = (
+        "The response was generated, but session storage could not be written. "
+        "Check the state database health (`hermes doctor`), then send your "
+        "message again."
+    )
+
     return {
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
-        "partial": turn.interrupted or turn.error is not None,
+        "completed": _successful_codex_turn and not _codex_persistence_failed,
+        "partial": (
+            turn.interrupted
+            or turn.error is not None
+            or _codex_persistence_failed
+        ),
         "interrupted": _user_interrupted,
         **(
             {"interrupt_message": _interrupt_message}
             if _interrupt_message
             else {}
         ),
-        "error": turn.error,
+        "error": (
+            _persistence_error_text if _codex_persistence_failed else turn.error
+        ),
+        **(
+            {"failed": True}
+            if turn.error is not None or _codex_persistence_failed
+            else {}
+        ),
+        **(
+            {
+                "failure_reason": (
+                    f"session_persistence_failed:{_persistence_cause}"
+                    if _codex_persistence_failed
+                    else "codex_turn_error"
+                )
+            }
+            if turn.error is not None or _codex_persistence_failed
+            else {}
+        ),
         # The codex app-server runtime IS an early-return path that bypasses
-        # conversation_loop, but we flush the projected assistant/tool messages
-        # ourselves above (see the _flush_messages_to_session_db call after
-        # messages.extend). The inbound user turn was already flushed at turn
-        # start (turn_context._persist_session) and the flush dedups via
-        # _DB_PERSISTED_MARKER, so state.db ends up with each real message
-        # exactly once and session_search / conversation-distill see the full
-        # gateway conversation. Report agent_persisted=True so the gateway
-        # skips its own append_to_transcript DB write — writing again there
-        # would re-INSERT the already-flushed user turn (append_message has no
-        # dedup), reintroducing the #860 / #42039 duplicate-write bug.
+        # conversation_loop, but the shared persistence helper calls the
+        # marker-aware _persist_session seam above. The inbound user turn was
+        # already flushed at turn start, so state.db receives each real message
+        # exactly once. Keep this True even when retries exhaust: the gateway's
+        # raw fallback would re-INSERT that already-persisted user row while it
+        # still could not make the assistant row authoritative (#860/#42039).
         "agent_persisted": True,
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,

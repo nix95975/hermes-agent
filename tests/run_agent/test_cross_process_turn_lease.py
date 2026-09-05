@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import os
 import threading
@@ -131,6 +132,182 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
     )
 
 
+def test_contended_lease_preserves_explicit_caller_history(monkeypatch):
+    db = _DB()
+    agent = _agent_with_db(db)
+    setattr(agent, "_preserve_caller_history_on_lease_wait", True)
+
+    def acquire_with_wait(session_id, holder, **kwargs):
+        db.events.append(("acquire", session_id, holder))
+        kwargs["on_wait"](0.0)
+        return True
+
+    db.acquire_session_turn_lease = acquire_with_wait
+    observed = {}
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        observed["history"] = history
+        observed["session_id"] = _agent.session_id
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+    explicit = []
+
+    AIAgent.run_conversation(agent, "new message", conversation_history=explicit)
+
+    assert observed == {"history": explicit, "session_id": "compressed-tip"}
+    assert [event[0] for event in db.events] == ["acquire", "resolve", "release"]
+
+
+def test_server_history_reloads_after_immediate_lease_admission(monkeypatch):
+    db = _DB()
+    agent = _agent_with_db(db)
+    setattr(agent, "_reload_durable_history_after_lease", True)
+    observed = {}
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        observed["history"] = history
+        observed["session_id"] = _agent.session_id
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+
+    AIAgent.run_conversation(
+        agent,
+        "new message",
+        conversation_history=[{"role": "user", "content": "stale API preload"}],
+    )
+
+    assert observed == {
+        "history": [{"role": "user", "content": "durable latest"}],
+        "session_id": "compressed-tip",
+    }
+    assert [event[0] for event in db.events] == [
+        "acquire",
+        "resolve",
+        "reload",
+        "release",
+    ]
+
+
+def test_server_history_fails_if_session_is_deleted_before_lease_admission(
+    monkeypatch,
+):
+    db = _DB()
+    probes = iter(({"id": "stale-parent"}, None))
+    db.get_session = lambda session_id: next(probes)
+    agent = _agent_with_db(db)
+    setattr(agent, "_reload_durable_history_after_lease", True)
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("deleted canonical session must not reach model work")
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", must_not_run)
+
+    result = AIAgent.run_conversation(
+        agent,
+        "new message",
+        conversation_history=[{"role": "user", "content": "stale API preload"}],
+    )
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["error"] == "session_not_found:stale-parent"
+    assert [event[0] for event in db.events] == ["acquire", "release"]
+
+
+@pytest.mark.parametrize("delete_stage", ["post_probe", "history_read", "model_work"])
+def test_live_turn_lease_fences_deletion_through_model_work(
+    tmp_path, monkeypatch, delete_stage
+):
+    """An owned-session delete racing post-admission never removes or recreates the row."""
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    deleting_db = SessionDB(path)
+    db.create_session(
+        "canonical", source="api_server", credential_owner="api-credential:owner-a"
+    )
+    db.append_message("canonical", role="user", content="durable history")
+    original_started_at = db.get_session("canonical")["started_at"]
+    agent = _agent_with_db(db, session_id="canonical")
+    setattr(agent, "_reload_durable_history_after_lease", True)
+    delete_errors = []
+    model_calls = []
+
+    def attempt_delete():
+        try:
+            deleting_db.delete_session("canonical")
+        except SessionTurnLeaseLostError as exc:
+            delete_errors.append(exc)
+
+    original_get_session = db.get_session
+    probe_count = 0
+
+    def get_session(session_id):
+        nonlocal probe_count
+        probe_count += 1
+        row = original_get_session(session_id)
+        if delete_stage == "post_probe" and probe_count == 2:
+            attempt_delete()
+        return row
+
+    original_history_read = db.get_messages_as_conversation
+
+    def get_history(session_id, **kwargs):
+        if delete_stage == "history_read":
+            attempt_delete()
+        return original_history_read(session_id, **kwargs)
+
+    db.get_session = get_session
+    db.get_messages_as_conversation = get_history
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        if delete_stage == "model_work":
+            attempt_delete()
+        session = deleting_db.get_session("canonical")
+        model_calls.append(session is not None)
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+
+    result = AIAgent.run_conversation(
+        agent,
+        "new message",
+        conversation_history=[{"role": "user", "content": "stale preload"}],
+    )
+
+    assert result["final_response"] == "ok"
+    assert len(delete_errors) == 1
+    assert model_calls == [True]
+    surviving = deleting_db.get_session("canonical")
+    assert surviving is not None
+    assert surviving["started_at"] == original_started_at
+    assert deleting_db.delete_session("canonical") is True
+    assert deleting_db.get_session("canonical") is None
+
+
+def test_server_history_fails_if_session_is_deleted_before_initial_probe(monkeypatch):
+    db = _DB(session_exists=False)
+    agent = _agent_with_db(db)
+    setattr(agent, "_reload_durable_history_after_lease", True)
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("deleted canonical session must not reach model work")
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", must_not_run)
+
+    result = AIAgent.run_conversation(
+        agent,
+        "new message",
+        conversation_history=[{"role": "user", "content": "stale API preload"}],
+    )
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["error"] == "session_not_found:stale-parent"
+    assert db.events == []
+
+
 def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
     """A locked / non-WAL get_session must not skip the durable lease."""
     db = _DB()
@@ -233,6 +410,36 @@ def test_preacquired_credential_lease_is_reused_through_history_model_and_persis
     assert observed["history"][0]["content"] == "canonical"
     assert observed["owner"] == "owner-a"
     assert deleting_db.delete_session("owned") is True
+
+
+def test_preacquired_credential_lease_preserves_explicit_caller_history(
+    tmp_path, monkeypatch
+):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("owned", source="api_server", credential_owner="owner-a")
+    db.append_message("owned", role="user", content="canonical")
+    holder = f"pid={os.getpid()}:api-run=caller-history"
+    assert db.try_acquire_session_turn_lease(
+        "owned", holder, expected_credential_owner="owner-a"
+    )
+    agent = _agent_with_db(db, session_id="owned", platform="api_server")
+    agent._credential_owner = "owner-a"
+    agent._preacquired_session_turn_lease_holder = holder
+    agent._preserve_caller_history_on_lease_wait = True
+    observed = {}
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        observed["history"] = history
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+    explicit = [{"role": "user", "content": "caller-authoritative"}]
+    result = AIAgent.run_conversation(
+        agent, "new message", conversation_history=explicit
+    )
+
+    assert result["final_response"] == "ok"
+    assert observed["history"] is explicit
 
 
 def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):

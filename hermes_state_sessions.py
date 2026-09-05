@@ -1462,7 +1462,7 @@ class SessionSessionsMixin:
         return [session_id, *sorted(delegate_ids)]
 
     def _check_session_delete_guards(self, conn, session_ids) -> None:
-        """Fence only credential-owned deletion targets; legacy rows retain old semantics."""
+        """Fence credential-owned deletion targets; legacy rows retain old semantics."""
         ids = {sid for sid in session_ids if sid}
         if not ids:
             return

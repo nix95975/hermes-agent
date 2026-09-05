@@ -259,8 +259,9 @@ def _resolve_conversation_history(
     instructions = body.get("instructions")
     previous_response_id = body.get("previous_response_id")
     conversation_history: List[Dict[str, str]] = []
+    conversation_history_supplied = "conversation_history" in body
     raw_history = body.get("conversation_history")
-    if raw_history:
+    if conversation_history_supplied:
         if not isinstance(raw_history, list):
             return [], instructions, None, _json_error(
                 _openai_error, "'conversation_history' must be an array of message objects", status=400)
@@ -273,14 +274,21 @@ def _resolve_conversation_history(
         if previous_response_id:
             logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
     stored_session_id = None
-    if not conversation_history and previous_response_id:
+    if not conversation_history_supplied and not conversation_history and previous_response_id:
         stored = self._response_store.get(previous_response_id)
-        if stored:
-            conversation_history = list(stored.get("conversation_history", []))
-            stored_session_id = stored.get("session_id")
-            if instructions is None:
-                instructions = stored.get("instructions")
-    if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+        if stored is None:
+            return [], instructions, None, _json_error(
+                _openai_error, f"Previous response not found: {previous_response_id}", status=404)
+        conversation_history = list(stored.get("conversation_history", []))
+        stored_session_id = stored.get("session_id")
+        if instructions is None:
+            instructions = stored.get("instructions")
+    if (
+        not conversation_history_supplied
+        and not conversation_history
+        and isinstance(raw_input, list)
+        and len(raw_input) > 1
+    ):
         for msg in raw_input[:-1]:
             if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
                 content = msg["content"]
@@ -332,6 +340,8 @@ class _RunLaunch:
     declared_selected: bool
     user_message: str
     conversation_history: List[Dict[str, str]]
+    caller_history_authoritative: bool
+    server_history_authoritative: bool
     agent_kwargs: dict  # ``_create_agent`` keyword arguments (prompt, model overrides, route, room policy)
     request_profile: Any
     request_auth_context: Any
@@ -461,7 +471,13 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     if history_err is not None:
         return history_err
     previous_response_id = body.get("previous_response_id")
+    caller_history_authoritative = bool(
+        "conversation_history" in body
+        or previous_response_id
+        or (isinstance(raw_input, list) and len(raw_input) > 1)
+    )
     session_id = body.get("session_id") or stored_session_id
+    server_history_authoritative = bool(session_id and not caller_history_authoritative)
 
     session_error = await self._credential_session_reference_error(session_id)
     if session_error is not None:
@@ -575,12 +591,18 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             return _json_error(
                 _openai_error, "Session database unavailable", code="session_db_unavailable", status=503)
 
-    if not conversation_history and load_session_history and not previous_response_id:
-        try:
-            conversation_history = await self._conversation_history_for_session(str(session_id))
-        except Exception:
+    if (
+        "conversation_history" not in body
+        and not conversation_history
+        and load_session_history
+        and not previous_response_id
+    ):
+        conversation_history, history_error = (
+            await self._conversation_history_for_existing_session(str(session_id))
+        )
+        if history_error is not None:
             _release_allocations(delete_implicit=True)
-            raise
+            return history_error
     q = self._run_streams[run_id] = asyncio.Queue()
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
@@ -600,7 +622,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         self._run_idempotency_ids.add(run_id)
     launch = _RunLaunch(
         self, run_id, q, str(session_id), gateway_session_key, _declared_selected, user_message,
-        conversation_history,
+        conversation_history, caller_history_authoritative, server_history_authoritative,
         agent_kwargs=dict(
             ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
@@ -648,6 +670,22 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     effective_task_id = session_id or run.run_id
     # (token, reset, fail-safe clear) triples unwound in the finally block; bound only once each step succeeds.
     resets: list[tuple[Any, Callable, Callable]] = []
+    missing = object()
+    authority_attr = (
+        "_preserve_caller_history_on_lease_wait" if run.caller_history_authoritative
+        else "_reload_durable_history_after_lease" if run.server_history_authoritative
+        else None
+    )
+    previous_authority = agent.__dict__.get(authority_attr, missing) if authority_attr else missing
+
+    def _restore_history_authority() -> None:
+        if not authority_attr:
+            return
+        if previous_authority is missing:
+            agent.__dict__.pop(authority_attr, None)
+        else:
+            setattr(agent, authority_attr, previous_authority)
+
     with self._profile_scope(run.request_profile):
         auth_token = _api_server._api_request_auth_context.set(run.request_auth_context)
         try:
@@ -678,6 +716,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
                 # so stop/cancel reaps only the background processes this run created.
                 _api_server._publish_turn_process_ownership(agent, effective_task_id)
+                if authority_attr:
+                    setattr(agent, authority_attr, True)
                 r = agent.run_conversation(
                     user_message=run.user_message, conversation_history=run.conversation_history,
                     task_id=effective_task_id)
@@ -685,6 +725,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 cleanup_error = None
                 cleanup_actions = [
                     lambda: _api_server._clear_turn_process_ownership(agent),
+                    _restore_history_authority,
                     lambda: (
                         self._bind_declared_conversation(
                             getattr(agent, "session_id", None) or session_id, run.gateway_session_key)

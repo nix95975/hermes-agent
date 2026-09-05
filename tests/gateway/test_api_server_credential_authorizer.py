@@ -403,9 +403,9 @@ async def test_credential_session_replacement_after_preflight_is_fenced(
         with pytest.raises(SessionTurnLeaseLostError):
             deleting_db.delete_session(sid)
         replacement_attempted.set()
-        return []
+        return [], None
 
-    monkeypatch.setattr(adapter, "_conversation_history_for_session", history)
+    monkeypatch.setattr(adapter, "_conversation_history_for_existing_session", history)
     seen = {}
     agent = MagicMock(session_id=session_id)
 
@@ -463,7 +463,7 @@ async def test_credential_session_recreated_foreign_before_lease_is_rejected(
         adapter._session_db, "try_acquire_session_turn_lease", replace_then_acquire
     )
     monkeypatch.setattr(
-        adapter, "_conversation_history_for_session",
+        adapter, "_conversation_history_for_existing_session",
         AsyncMock(side_effect=AssertionError("history must not load")),
     )
     monkeypatch.setattr(
@@ -2186,6 +2186,8 @@ async def test_runs_executor_clears_every_context_after_each_cleanup_failure(
         declared_selected=True,
         user_message="hello",
         conversation_history=[],
+        caller_history_authoritative=False,
+        server_history_authoritative=False,
         agent_kwargs={
             "room_dispatch": {"room_id": "room-one"},
             "room_execution_policy": policy,

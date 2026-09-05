@@ -242,10 +242,53 @@ def admit_durable_turn_lease(
     admission = TurnLeaseAdmission(conversation_history=conversation_history)
     if db is None or not session_id:
         return admission
+    preserve_caller_history = bool(
+        getattr(agent, "_preserve_caller_history_on_lease_wait", False)
+    )
     server_history_authoritative = bool(
         getattr(agent, "_reload_durable_history_after_lease", False)
-        and not getattr(agent, "_preserve_caller_history_on_lease_wait", False)
+        and not preserve_caller_history
     )
+    expected_owner = getattr(agent, "_credential_owner", None)
+    preacquired_holder = getattr(agent, "_preacquired_session_turn_lease_holder", None)
+    if preacquired_holder:
+        from hermes_state_errors import SessionTurnLeaseLostError
+        if not db.refresh_session_turn_lease(
+            session_id, preacquired_holder, ttl_seconds=LEASE_TTL_SECONDS,
+            expected_credential_owner=expected_owner,
+        ):
+            raise SessionTurnLeaseLostError(
+                f"Pre-acquired session turn lease was lost for {session_id!r}"
+            )
+        lease = DurableTurnLease(agent, db, session_id, preacquired_holder)
+        agent._active_session_turn_lease_holder = preacquired_holder
+        agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
+        agent._session_db_created = True
+        try:
+            latest_session_id = db.resolve_resume_session_id(session_id) or session_id
+            if expected_owner is not None:
+                latest_session = db.get_session(latest_session_id)
+                if (
+                    latest_session is None
+                    or latest_session.get("credential_owner") != expected_owner
+                ):
+                    raise SessionTurnLeaseLostError(
+                        f"Credential ownership changed while resuming {session_id!r}"
+                    )
+            agent.session_id = latest_session_id
+            task_context["session_id"] = latest_session_id
+            if not preserve_caller_history:
+                admission.conversation_history = db.get_messages_as_conversation(
+                    latest_session_id, repair_alternation=True, include_row_ids=True
+                )
+            lease.build_threads()
+        except BaseException:
+            lease.release()
+            raise
+        finally:
+            agent._preacquired_session_turn_lease_holder = None
+        admission.lease = lease
+        return admission
     # A fresh session id has no durable transcript to race over, and callers may supply an
     # in-memory seed before the row exists — reloading would erase it. Check the concrete type:
     # MagicMock-style shims accept any attribute without the protocol.
@@ -257,7 +300,7 @@ def admit_durable_turn_lease(
         return admission
     if (
         getattr(agent, "_persist_disabled", False)
-        or not durable_session_exists
+        or (expected_owner is None and not durable_session_exists)
         or not callable(getattr(type(db), "acquire_session_turn_lease", None))
     ):
         return admission
@@ -281,6 +324,7 @@ def admit_durable_turn_lease(
     if not db.acquire_session_turn_lease(
         session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
         on_wait=_on_wait, should_abort=lambda: getattr(agent, "_interrupt_requested", False),
+        expected_credential_owner=expected_owner,
     ):
         admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history)
         return admission
@@ -291,9 +335,9 @@ def admit_durable_turn_lease(
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
     try:
-        refresh_history = waited or server_history_authoritative
+        refresh_history = waited or server_history_authoritative or expected_owner is not None
         if refresh_history:
-            if getattr(agent, "_preserve_caller_history_on_lease_wait", False):
+            if preserve_caller_history:
                 agent._emit_status("Session is free; preserving caller-provided history...")
             else:
                 agent._emit_status("Session is free; loading the latest transcript...")
@@ -320,7 +364,7 @@ def admit_durable_turn_lease(
             if latest_session_id:
                 agent.session_id = latest_session_id
                 task_context["session_id"] = latest_session_id
-            if not getattr(agent, "_preserve_caller_history_on_lease_wait", False):
+            if not preserve_caller_history:
                 admission.conversation_history = db.get_messages_as_conversation(
                     agent.session_id, repair_alternation=True, include_row_ids=True
                 )

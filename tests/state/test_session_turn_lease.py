@@ -102,6 +102,59 @@ def test_destructive_session_paths_fence_live_turn_leases_and_reclaim_stale(
     assert not owner.refresh_session_turn_lease("shared", holder, ttl_seconds=30)
 
 
+def test_credential_owner_is_atomically_validated_and_fenced_by_turn_lease(tmp_path):
+    path = tmp_path / "state.db"
+    owner_db = SessionDB(path)
+    racing_db = SessionDB(path)
+    owner_db.create_session("shared", source="api_server", credential_owner="owner-a")
+    holder = f"pid={os.getpid()}:turn=credential"
+
+    with pytest.raises(SessionTurnLeaseLostError):
+        owner_db.try_acquire_session_turn_lease(
+            "shared", holder, expected_credential_owner="owner-b"
+        )
+    assert owner_db.try_acquire_session_turn_lease(
+        "shared", holder, expected_credential_owner="owner-a"
+    )
+    with pytest.raises(SessionTurnLeaseLostError):
+        racing_db.delete_session("shared")
+    assert racing_db.get_session("shared")["credential_owner"] == "owner-a"
+
+    owner_db.release_session_turn_lease("shared", holder)
+    assert racing_db.delete_session("shared")
+    racing_db.create_session("shared", source="api_server", credential_owner="owner-b")
+    with pytest.raises(SessionTurnLeaseLostError):
+        owner_db.try_acquire_session_turn_lease(
+            "shared", holder, expected_credential_owner="owner-a"
+        )
+
+
+def test_legacy_bulk_delete_empty_input_remains_noop_under_credential_fencing(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    assert db.delete_sessions([]) == 0
+
+
+def test_credential_owned_delegate_target_is_fenced_during_unowned_parent_delete(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("legacy-parent", source="cli")
+    db.create_session(
+        "owned-delegate",
+        source="delegate",
+        parent_session_id="legacy-parent",
+        credential_owner="owner-a",
+        model_config={"_delegate_from": "legacy-parent"},
+    )
+    assert db.try_acquire_session_turn_lease(
+        "owned-delegate", f"pid={os.getpid()}:turn=owned-target", ttl_seconds=300
+    )
+
+    with pytest.raises(SessionTurnLeaseLostError):
+        db.delete_session("legacy-parent")
+
+    assert db.get_session("legacy-parent") is not None
+    assert db.get_session("owned-delegate") is not None
+
+
 def test_turn_lease_is_scoped_to_conversation_root(tmp_path):
     """Compression descendants share one durable serialization domain."""
     db = SessionDB(tmp_path / "state.db")

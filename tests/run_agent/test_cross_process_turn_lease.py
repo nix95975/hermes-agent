@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import os
 import threading
 import time
 from types import SimpleNamespace
@@ -12,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent import relay_runtime
+from agent.turn_facade_lease import DurableTurnLease
 from hermes_state import SessionDB
 from hermes_state_errors import SessionTurnLeaseLostError
 from run_agent import AIAgent
@@ -412,19 +412,21 @@ def test_preacquired_credential_lease_is_reused_through_history_model_and_persis
     assert deleting_db.delete_session("owned") is True
 
 
-def test_preacquired_credential_lease_preserves_explicit_caller_history(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("preacquired", [False, True], ids=["normal", "preacquired"])
+def test_credential_lease_preserves_explicit_caller_history(
+    tmp_path, monkeypatch, preacquired
 ):
     db = SessionDB(tmp_path / "state.db")
     db.create_session("owned", source="api_server", credential_owner="owner-a")
     db.append_message("owned", role="user", content="canonical")
-    holder = f"pid={os.getpid()}:api-run=caller-history"
-    assert db.try_acquire_session_turn_lease(
-        "owned", holder, expected_credential_owner="owner-a"
-    )
     agent = _agent_with_db(db, session_id="owned", platform="api_server")
     agent._credential_owner = "owner-a"
-    agent._preacquired_session_turn_lease_holder = holder
+    if preacquired:
+        holder = f"pid={os.getpid()}:api-run=caller-history"
+        assert db.try_acquire_session_turn_lease(
+            "owned", holder, expected_credential_owner="owner-a"
+        )
+        agent._preacquired_session_turn_lease_holder = holder
     agent._preserve_caller_history_on_lease_wait = True
     observed = {}
 
@@ -440,6 +442,94 @@ def test_preacquired_credential_lease_preserves_explicit_caller_history(
 
     assert result["final_response"] == "ok"
     assert observed["history"] is explicit
+
+
+def _foreign_owned_compression_tip(db: SessionDB) -> None:
+    db.create_session("root", source="api_server", credential_owner="owner-a")
+    db.end_session("root", "compression")
+    db.create_session(
+        "tip", source="api_server", parent_session_id="root", credential_owner="owner-b"
+    )
+    db.append_message("tip", role="user", content="FOREIGN_SECRET")
+
+
+@pytest.mark.parametrize("preacquired", [False, True], ids=["normal", "preacquired"])
+@pytest.mark.parametrize("caller_history", [None, []], ids=["canonical", "caller-history"])
+def test_credential_turn_rejects_foreign_compression_tip_before_model_or_disclosure(
+    tmp_path, monkeypatch, preacquired, caller_history
+):
+    db = SessionDB(tmp_path / f"foreign-tip-{preacquired}-{caller_history is not None}.db")
+    _foreign_owned_compression_tip(db)
+    agent = _agent_with_db(db, session_id="root", platform="api_server")
+    agent._credential_owner = "owner-a"
+    if caller_history is not None:
+        agent._preserve_caller_history_on_lease_wait = True
+    if preacquired:
+        holder = f"pid={os.getpid()}:api-run=foreign-tip"
+        assert db.try_acquire_session_turn_lease(
+            "root", holder, expected_credential_owner="owner-a"
+        )
+        agent._preacquired_session_turn_lease_holder = holder
+
+    model_calls = []
+
+    def must_not_run(*args, **kwargs):
+        model_calls.append((args, kwargs))
+        raise AssertionError("foreign continuation must not reach model work")
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", must_not_run)
+    explicit = (
+        [{"role": "user", "content": "caller-authoritative"}]
+        if caller_history is not None
+        else [{"role": "user", "content": "stale preload"}]
+    )
+
+    with pytest.raises(SessionTurnLeaseLostError) as exc_info:
+        AIAgent.run_conversation(agent, "new message", conversation_history=explicit)
+
+    assert model_calls == []
+    assert "FOREIGN_SECRET" not in str(exc_info.value)
+    assert explicit == [
+        {
+            "role": "user",
+            "content": "caller-authoritative" if caller_history is not None else "stale preload",
+        }
+    ]
+
+
+def test_credential_lease_refresh_rejects_recreated_foreign_tip(tmp_path):
+    path = tmp_path / "refresh-recreated-tip.db"
+    db = SessionDB(path)
+    racing_db = SessionDB(path)
+    db.create_session("root", source="api_server", credential_owner="owner-a")
+    db.end_session("root", "compression")
+    db.create_session(
+        "tip", source="api_server", parent_session_id="root", credential_owner="owner-a"
+    )
+    holder = f"pid={os.getpid()}:turn=refresh-recreated-tip"
+    assert db.try_acquire_session_turn_lease(
+        "root", holder, expected_credential_owner="owner-a"
+    )
+    agent = _agent_with_db(db, session_id="tip", platform="api_server")
+    agent._credential_owner = "owner-a"
+    interrupts = []
+    agent.interrupt = lambda message, **kwargs: interrupts.append((message, kwargs))
+    lease = DurableTurnLease(
+        agent, db, "root", holder, expected_credential_owner="owner-a"
+    )
+    lease.turn_active = True
+
+    # Simulate an out-of-contract database replacement that bypasses the ordinary deletion fence.
+    racing_db._conn.execute("DELETE FROM sessions WHERE id = ?", ("tip",))
+    racing_db._conn.commit()
+    racing_db.create_session(
+        "tip", source="api_server", parent_session_id="root", credential_owner="owner-b"
+    )
+    racing_db.append_message("tip", role="user", content="FOREIGN_SECRET")
+
+    assert lease.refresh_tick() is False
+    assert interrupts
+    assert "FOREIGN_SECRET" not in str(interrupts)
 
 
 def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):

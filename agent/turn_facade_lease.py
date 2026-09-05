@@ -28,11 +28,15 @@ class DurableTurnLease:
     written only under ``_lock``.
     """
 
-    def __init__(self, agent, db, session_id: str, holder: str) -> None:
+    def __init__(
+        self, agent, db, session_id: str, holder: str,
+        expected_credential_owner: Optional[str] = None,
+    ) -> None:
         self.agent = agent
         self.db = db
         self.session_id = session_id  # id at admission; release always targets this row
         self.holder = holder
+        self.expected_credential_owner = expected_credential_owner
         self.stop = threading.Event()
         self.refresh_interval = float(getattr(agent, "_session_turn_lease_refresh_interval", 60.0))
         self._lock = threading.Lock()
@@ -182,7 +186,8 @@ class DurableTurnLease:
             return False
         try:
             if self.db.refresh_session_turn_lease(
-                self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS
+                self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS,
+                expected_credential_owner=self.expected_credential_owner,
             ):
                 return None
             if self.stop.is_set():
@@ -229,6 +234,24 @@ def _durable_session_exists(db, session_id: str) -> bool:
         return True
 
 
+def _resolve_owned_turn_history(db, session_id: str, expected_owner: str):
+    """Validate the credential lineage and load its canonical replay in one snapshot."""
+    from hermes_state_errors import SessionTurnLeaseLostError
+
+    resolved = db.resolve_owned_session_messages(
+        session_id,
+        expected_credential_owner=expected_owner,
+        as_conversation=True,
+        repair_alternation=True,
+        include_row_ids=True,
+    )
+    if resolved is None:
+        raise SessionTurnLeaseLostError(
+            f"Session credential ownership changed; refusing turn for {session_id!r}"
+        )
+    return resolved
+
+
 def admit_durable_turn_lease(
     agent, *, session_id: str, relay_turn_id: str, task_context: Dict[str, Any],
     conversation_history: Optional[List[Dict[str, Any]]],
@@ -260,18 +283,31 @@ def admit_durable_turn_lease(
             raise SessionTurnLeaseLostError(
                 f"Pre-acquired session turn lease was lost for {session_id!r}"
             )
-        lease = DurableTurnLease(agent, db, session_id, preacquired_holder)
+        lease = DurableTurnLease(
+            agent, db, session_id, preacquired_holder,
+            expected_credential_owner=expected_owner,
+        )
         agent._active_session_turn_lease_holder = preacquired_holder
         agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
         agent._session_db_created = True
         try:
-            latest_session_id = db.resolve_resume_session_id(session_id)
+            if expected_owner is not None:
+                latest_session_id, canonical_history = _resolve_owned_turn_history(
+                    db, session_id, expected_owner
+                )
+            else:
+                latest_session_id = db.resolve_resume_session_id(session_id)
+                canonical_history = None
             if latest_session_id:
                 agent.session_id = latest_session_id
                 task_context["session_id"] = latest_session_id
             if not preserve_caller_history:
-                admission.conversation_history = db.get_messages_as_conversation(
-                    agent.session_id, repair_alternation=True, include_row_ids=True
+                admission.conversation_history = (
+                    canonical_history
+                    if expected_owner is not None
+                    else db.get_messages_as_conversation(
+                        agent.session_id, repair_alternation=True, include_row_ids=True
+                    )
                 )
             lease.build_threads()
         except BaseException:
@@ -323,7 +359,9 @@ def admit_durable_turn_lease(
 
     # Assign only after admission so the finally cannot release a holder that never owned the
     # row; persist paths read the agent attr so a late flush is fenced in the same transaction.
-    lease = DurableTurnLease(agent, db, session_id, holder)
+    lease = DurableTurnLease(
+        agent, db, session_id, holder, expected_credential_owner=expected_owner
+    )
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
     try:
@@ -352,13 +390,23 @@ def admit_durable_turn_lease(
         if refresh_history:
             # Another holder may append or rotate after an API handler's preload, including when it
             # releases before our first acquire attempt. Resolve/reload only after admission.
-            latest_session_id = db.resolve_resume_session_id(session_id)
+            if expected_owner is not None:
+                latest_session_id, canonical_history = _resolve_owned_turn_history(
+                    db, session_id, expected_owner
+                )
+            else:
+                latest_session_id = db.resolve_resume_session_id(session_id)
+                canonical_history = None
             if latest_session_id:
                 agent.session_id = latest_session_id
                 task_context["session_id"] = latest_session_id
             if not getattr(agent, "_preserve_caller_history_on_lease_wait", False):
-                admission.conversation_history = db.get_messages_as_conversation(
-                    agent.session_id, repair_alternation=True, include_row_ids=True
+                admission.conversation_history = (
+                    canonical_history
+                    if expected_owner is not None
+                    else db.get_messages_as_conversation(
+                        agent.session_id, repair_alternation=True, include_row_ids=True
+                    )
                 )
         lease.build_threads()
     except BaseException:

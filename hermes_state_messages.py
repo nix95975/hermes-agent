@@ -658,6 +658,8 @@ class SessionMessagesMixin:
     def resolve_owned_session_messages(
         self, session_id: str, *, expected_credential_owner: str,
         limit: Optional[int] = None, offset: int = 0, latest: bool = False,
+        as_conversation: bool = False, repair_alternation: bool = False,
+        include_row_ids: bool = False,
     ) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
         """Resolve a resume tip and page its messages in one read transaction.
 
@@ -665,7 +667,9 @@ class SessionMessagesMixin:
         every selected continuation, and the final message-bearing row must retain the exact
         expected owner throughout the snapshot; a missing/mismatched row is indistinguishable
         from not found. ``latest`` uses :meth:`get_messages` semantics: count backward from
-        the newest row, then return the selected page chronologically.
+        the newest row, then return the selected page chronologically. ``as_conversation``
+        returns the same model-replay projection as :meth:`get_messages_as_conversation` so
+        credential turn admission can validate and load from one owner-aware snapshot.
         """
         if not session_id or not expected_credential_owner:
             return None
@@ -730,8 +734,9 @@ class SessionMessagesMixin:
                 ):
                     return None
 
+                columns = self._CONVERSATION_ROW_COLUMNS if as_conversation else "*"
                 sql = (
-                    "SELECT * FROM messages WHERE session_id = ? AND active = 1 "
+                    f"SELECT {columns} FROM messages WHERE session_id = ? AND active = 1 "
                     f"ORDER BY id {'DESC' if latest else 'ASC'}"
                 )
                 params: List[Any] = [resolved]
@@ -743,6 +748,14 @@ class SessionMessagesMixin:
                 conn.execute("ROLLBACK")
         if latest:
             rows.reverse()
+        if as_conversation:
+            return resolved, self._rows_to_conversation(
+                rows,
+                session_id=resolved,
+                include_ancestors=False,
+                repair_alternation=repair_alternation,
+                include_row_ids=include_row_ids,
+            )
         return resolved, [
             self._row_to_message_dict(
                 row, warn_context="resolve_owned_session_messages", summary_flag=True

@@ -1374,6 +1374,25 @@ def register(ctx):
     ctx.register_platform_handler("discord", _wire)
 ```
 
+### Authorize scoped API Server credentials
+
+An operator-installed plugin may register one API Server credential authorizer with
+`ctx.register_api_server_credential_authorizer(authorizer)`. The object must define an async
+coroutine method, `async def authorize(request)`, which receives a bounded
+`CredentialAuthorizationRequest` and returns an exact immutable `AuthorizedAPICredential` or
+`None`. Synchronous `authorize` methods are rejected during plugin registration. Contracts and the
+finite operation enum live in `gateway.api_credentials`. The static `API_SERVER_KEY` is always
+checked first and remains the administrator path. Enabling more than one authorizer prevents the
+API Server from starting.
+
+Only capability discovery, session resolve/create, run create/status, and run-event reads are eligible.
+All other API routes remain static-admin or keep their existing independent authentication. Before
+calling `POST /v1/runs`, a credential client must create or resolve a session through the authorized
+session routes, then send that exact owned ID as the explicit `session_id`; credential-authorized
+runs never use the generated `run_id` as an implicit session. The returned runtime profile and
+credential scope are server authority: never derive either from the bearer or copy client profile
+fields into the principal.
+
 :::tip
 This guide covers **general plugins** (tools, hooks, slash commands, CLI commands). The sections below sketch the authoring pattern for each specialized plugin type; each links to its full guide for field reference and examples.
 :::

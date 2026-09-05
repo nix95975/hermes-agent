@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import suppress
@@ -88,6 +89,7 @@ def _initialize_run_state(self, *, store_factory) -> None:
     # outlive the request, hence the separate stopping set), pollable statuses, and
     # approval session keys (approval core resolves by session key, clients by run_id).
     self._run_idempotency_ids: set[str] = set()
+    self._run_id_allocation_lock = threading.Lock()
     self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
     (
@@ -194,6 +196,10 @@ def _run_idempotency_scope(self, request: "web.Request", *, _api_server) -> str:
             "room_id", "home_install_id", "authority_gateway_id", "authority_epoch",
             "member_id", "target_install_id", "target_profile"))
     else:
+        auth_context = _api_server._api_request_auth_context.get()
+        credential_owner = getattr(auth_context, "owner_key", None)
+        if credential_owner:
+            return str(credential_owner)
         parts = (_api_server._api_request_profile.get() or "default",
                  self._expected_api_key() or "unauthenticated-test-listener")
     return hashlib.sha256("\0".join(map(str, parts)).encode()).hexdigest()
@@ -285,13 +291,18 @@ def _resolve_conversation_history(
     return conversation_history, instructions, stored_session_id, None
 
 
-def _accepted_response(run_id: str, status: str, gateway_session_key, *, replayed: bool) -> "web.Response":
+def _accepted_response(
+    run_id: str, status: str, gateway_session_key, *, replayed: bool,
+    session_id: Optional[str] = None,
+) -> "web.Response":
     """202 admission response; replays are flagged via ``Idempotency-Replayed``."""
     headers = {"Idempotency-Replayed": "true"} if replayed else {}
     if gateway_session_key:
         headers["X-Hermes-Session-Key"] = gateway_session_key
-    return web.json_response(
-        {"run_id": run_id, "status": status, "replayed": replayed}, status=202, headers=headers)
+    payload = {"run_id": run_id, "status": status, "replayed": replayed}
+    if session_id:
+        payload["session_id"] = session_id
+    return web.json_response(payload, status=202, headers=headers)
 
 
 def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error) -> "web.Response":
@@ -302,7 +313,10 @@ def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _op
             code="idempotency_key_conflict", status=409)
     original_id = str(record["run_id"])
     status = self._durable_run_status(request, original_id) or record["status"]
-    return _accepted_response(original_id, status.get("status", "queued"), gateway_session_key, replayed=True)
+    return _accepted_response(
+        original_id, status.get("status", "queued"), gateway_session_key, replayed=True,
+        session_id=status.get("session_id"),
+    )
 
 
 @dataclass(slots=True)
@@ -320,8 +334,12 @@ class _RunLaunch:
     conversation_history: List[Dict[str, str]]
     agent_kwargs: dict  # ``_create_agent`` keyword arguments (prompt, model overrides, route, room policy)
     request_profile: Any
+    request_auth_context: Any
     browser_control_principal: Any
     browser_control_transport_family: Any
+    session_db: Any = None
+    credential_session_lease_holder: Optional[str] = None
+    credential_session_lease_refresh_handle: Any = None
 
     @property
     def approval_session_key(self) -> str:
@@ -339,6 +357,44 @@ def _forget_run(self, run_id: str, *tables) -> None:
     for table in tables:
         (table.discard if isinstance(table, set) else lambda k: table.pop(k, None))(run_id)
     self._release_run_owner_if_forgotten(run_id)
+
+
+def _generated_run_id_exists(self, run_id: str) -> bool:
+    """Check every live and durable run namespace before reserving a generated ID."""
+    live_namespaces = (
+        self._run_owners,
+        self._run_streams,
+        self._run_streams_created,
+        self._active_run_agents,
+        self._active_run_tasks,
+        self._run_statuses,
+        self._run_approval_sessions,
+        self._run_stream_subscribers,
+        self._stopping_run_ids,
+        self._run_idempotency_ids,
+    )
+    if any(run_id in namespace for namespace in live_namespaces):
+        return True
+    durable_run = self._run_idempotency_store.has_run_id(run_id)
+    if not isinstance(durable_run, bool):
+        raise RuntimeError("durable run status store returned an invalid result")
+    if durable_run:
+        return True
+    return False
+
+
+def _reserve_generated_run_id(self, owner: str, *, attempts: int = 32) -> Optional[str]:
+    """Atomically reserve a fresh owner-scoped ID across live and durable run namespaces."""
+    with self._run_id_allocation_lock:
+        try:
+            for _ in range(attempts):
+                run_id = f"run_{uuid.uuid4().hex}"
+                if not _generated_run_id_exists(self, run_id):
+                    self._run_owners[run_id] = owner
+                    return run_id
+        except Exception:
+            logger.warning("Unable to verify generated run-ID namespaces", exc_info=True)
+    return None
 
 
 def _retire_live_run(self, run_id: str) -> None:
@@ -390,12 +446,35 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         user_message = raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
     if not user_message:
         return _json_error(_openai_error, "No user message found in input", status=400)
+    credential_owner = self._credential_owner()
+    if credential_owner is not None and body.get("previous_response_id"):
+        return _json_error(
+            _openai_error, "previous_response_id is not available to this credential",
+            code="credential_operation_forbidden", status=403)
+    if credential_owner is not None and not body.get("session_id"):
+        return _json_error(
+            _openai_error,
+            "Credential-authorized runs require an explicit pre-existing session_id",
+            code="credential_session_required", status=400)
     conversation_history, instructions, stored_session_id, history_err = (
         _resolve_conversation_history(self, body, raw_input, _openai_error=_openai_error))
     if history_err is not None:
         return history_err
     previous_response_id = body.get("previous_response_id")
     session_id = body.get("session_id") or stored_session_id
+
+    session_error = await self._credential_session_reference_error(session_id)
+    if session_error is not None:
+        return session_error
+    if credential_owner is not None:
+        try:
+            durability_state = self._run_idempotency_store.durability_state
+        except Exception:
+            durability_state = "unavailable"
+        if durability_state not in {"durable", "memory"}:
+            return _json_error(
+                _openai_error, "Durable run storage is unavailable; retry shortly",
+                code="run_storage_unavailable", status=503)
     route = self._resolve_route(body.get("model"))
     agent_overrides = _api_server._request_agent_overrides(body, virtual_model=self._model_name)
     selection_error = self._request_route_conflict_error(
@@ -416,15 +495,92 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     limited = self._concurrency_limited_response()
     if limited is not None:
         return limited
-    if not conversation_history and session_id and not previous_response_id:
-        conversation_history = await self._conversation_history_for_session(str(session_id))
-    run_id = f"run_{uuid.uuid4().hex}"
-    self._run_owners[run_id] = self._run_idempotency_scope(request)
-    # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
-    # conversation > run_id (which would otherwise re-key every affinity surface per run).
-    # An explicit or chained session owns its routing key and is never rebound to the header.
+    run_id = _reserve_generated_run_id(self, self._run_idempotency_scope(request))
+    if run_id is None:
+        return _json_error(
+            _openai_error, "Unable to allocate a run identifier; retry shortly",
+            code="run_id_allocation_failed", status=503)
+
+    session_db = None
+    implicit_session_reserved = False
+    credential_lease_holder = None
+    credential_lease_refresh_handle = None
+
+    def _release_allocations(*, delete_implicit: bool = False) -> None:
+        if credential_lease_refresh_handle is not None:
+            with suppress(Exception):
+                credential_lease_refresh_handle.cancel(wait=1.0)
+        if credential_lease_holder and session_db is not None:
+            with suppress(Exception):
+                session_db.release_session_turn_lease(str(session_id), credential_lease_holder)
+        if delete_implicit and implicit_session_reserved and session_db is not None:
+            with suppress(Exception):
+                session_db.delete_session_if_empty(str(session_id))
+        _forget_run(self, run_id, self._run_owners)
+
+    # Preserve the legacy static/room contract: without an explicit/chained/header session,
+    # the run ID is also the transcript ID. Credential callers never reach this fallback because
+    # they must supply an explicit, pre-existing, exact-owned session above.
     _declared_selected = not session_id and bool(gateway_session_key)
-    session_id = session_id or self._declared_conversation_session(gateway_session_key) or run_id
+    session_id = session_id or self._declared_conversation_session(gateway_session_key)
+    load_session_history = bool(session_id)
+    if not session_id:
+        session_id = run_id
+
+    if credential_owner is not None:
+        from hermes_state_errors import SessionTurnLeaseLostError
+        session_db = session_db or await self._ensure_session_db_async()
+        if session_db is None:
+            _release_allocations(delete_implicit=True)
+            return self._session_db_unavailable()
+        credential_lease_holder = f"pid={os.getpid()}:api-run={run_id}"
+        try:
+            acquired = await asyncio.to_thread(
+                session_db.try_acquire_session_turn_lease,
+                str(session_id), credential_lease_holder,
+                expected_credential_owner=credential_owner,
+            )
+        except SessionTurnLeaseLostError:
+            _release_allocations(delete_implicit=True)
+            return _json_error(
+                _openai_error, f"Session not found: {session_id}",
+                code="session_not_found", status=404)
+        except Exception:
+            logger.warning("Unable to acquire credential session lease", exc_info=True)
+            _release_allocations(delete_implicit=True)
+            return _json_error(
+                _openai_error, "Session database unavailable", code="session_db_unavailable", status=503)
+        if not acquired:
+            _release_allocations(delete_implicit=True)
+            return _json_error(
+                _openai_error, "Session is busy; retry shortly",
+                code="session_busy", status=409)
+        from agent.periodic_scheduler import schedule
+
+        def _refresh_credential_lease():
+            try:
+                return None if session_db.refresh_session_turn_lease(
+                    str(session_id), credential_lease_holder,
+                    expected_credential_owner=credential_owner,
+                ) else False
+            except Exception:
+                logger.warning("Credential session lease refresh failed", exc_info=True)
+                return False
+
+        try:
+            credential_lease_refresh_handle = schedule(_refresh_credential_lease, 60.0)
+        except Exception:
+            logger.warning("Unable to start credential session lease refresh", exc_info=True)
+            _release_allocations(delete_implicit=True)
+            return _json_error(
+                _openai_error, "Session database unavailable", code="session_db_unavailable", status=503)
+
+    if not conversation_history and load_session_history and not previous_response_id:
+        try:
+            conversation_history = await self._conversation_history_for_session(str(session_id))
+        except Exception:
+            _release_allocations(delete_implicit=True)
+            raise
     q = self._run_streams[run_id] = asyncio.Queue()
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
@@ -438,33 +594,46 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         if outcome != "created":
             _forget_run(
                 self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
-                self._run_statuses, self._run_owners)
+                self._run_statuses)
+            _release_allocations(delete_implicit=True)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
     launch = _RunLaunch(
-        self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
+        self, run_id, q, str(session_id), gateway_session_key, _declared_selected, user_message,
         conversation_history,
         agent_kwargs=dict(
             ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
+            credential_owner=credential_owner,
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
+        request_auth_context=_api_server._api_request_auth_context.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
-        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get())
+        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
+        session_db=session_db,
+        credential_session_lease_holder=credential_lease_holder,
+        credential_session_lease_refresh_handle=credential_lease_refresh_handle)
     self._activate_admitted_request()
-    task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
+    try:
+        task = self._active_run_tasks[run_id] = asyncio.create_task(
+            _execute_run(self, launch, _api_server=_api_server))
+    except BaseException:
+        _release_allocations(delete_implicit=True)
+        raise
     with suppress(TypeError):
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
-    return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
+    return _accepted_response(
+        run_id, "started", gateway_session_key, replayed=False, session_id=str(session_id))
 
 
 def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_server):
     """Executor-thread body of one run; returns ``(result, usage)``."""
-    from gateway.session_context import clear_session_vars
+    from gateway.session_context import clear_session_vars, _clear_session_vars_unconditionally
     from gateway.hosted_room_execution_policy import (
-        RoomExecutionPolicy, bind_room_execution_policy, reset_room_execution_policy)
+        RoomExecutionPolicy, bind_room_execution_policy, reset_room_execution_policy,
+        _clear_room_execution_policy_unconditionally)
     # No eager slash-worker pre-warm: slash.exec spawns one on demand (its error path already relies on that
     # respawn to recover from a dead worker). Each worker child runs its own MCP discovery (#61891), so
     # pre-warming one per session forks the full stdio MCP fleet — ~20 OS processes per retained session on
@@ -472,46 +641,75 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     # held by a live transport are never reaped, so with the desktop app open for days those fleets
     # accumulate until the OS refuses new process spawns.
     from tools.approval import register_gateway_notify, unregister_gateway_notify
-    from tools.approval_context import reset_current_session_key, set_current_session_key
+    from tools.approval_context import (
+        reset_current_session_key, set_current_session_key,
+        _clear_current_session_key_unconditionally)
     session_id = run.session_id
     effective_task_id = session_id or run.run_id
-    # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
-    resets: list[tuple[Any, Callable]] = []
+    # (token, reset, fail-safe clear) triples unwound in the finally block; bound only once each step succeeds.
+    resets: list[tuple[Any, Callable, Callable]] = []
     with self._profile_scope(run.request_profile):
+        auth_token = _api_server._api_request_auth_context.set(run.request_auth_context)
         try:
-            # Contextvars, not process env: concurrent runs must not share identity.
-            resets.append((set_current_session_key(run.approval_session_key), reset_current_session_key))
-            # chat_id carries the raw session id like _run_agent() does; without it
-            # tools.async_delegation sees no HERMES_SESSION_CHAT_ID and forces delegations sync.
-            session_tokens = self._bind_api_server_session(
-                chat_id=session_id or "", session_key=run.approval_session_key, session_id=session_id or "",
-                browser_control_principal=run.browser_control_principal,
-                browser_control_transport_family=run.browser_control_transport_family)
-            if session_tokens:
-                resets.append((session_tokens, clear_session_vars))
-            if run.agent_kwargs["room_dispatch"] is not None:
-                policy = RoomExecutionPolicy.from_mapping(run.agent_kwargs["room_execution_policy"] or {})
-                resets.append((bind_room_execution_policy(policy), reset_room_execution_policy))
-            register_gateway_notify(run.approval_session_key, approval_notify)
-            # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
-            # so stop/cancel reaps only the background processes this run created.
-            _api_server._publish_turn_process_ownership(agent, effective_task_id)
-            r = agent.run_conversation(
-                user_message=run.user_message, conversation_history=run.conversation_history,
-                task_id=effective_task_id)
-        finally:
-            # Clear ownership now so a later stop can't reap work this run left running.
-            _api_server._clear_turn_process_ownership(agent)
-            # Declared-conversation binding, same precedence gate as _run_agent.
-            if run.declared_selected:
-                self._bind_declared_conversation(
-                    getattr(agent, "session_id", None) or session_id, run.gateway_session_key)
             try:
-                unregister_gateway_notify(run.approval_session_key)
+                # Contextvars, not process env: concurrent runs must not share identity.
+                resets.append((
+                    set_current_session_key(run.approval_session_key),
+                    reset_current_session_key,
+                    _clear_current_session_key_unconditionally,
+                ))
+                # chat_id carries the raw session id like _run_agent() does; without it
+                # tools.async_delegation sees no HERMES_SESSION_CHAT_ID and forces delegations sync.
+                session_tokens = self._bind_api_server_session(
+                    chat_id=session_id or "", session_key=run.approval_session_key, session_id=session_id or "",
+                    browser_control_principal=run.browser_control_principal,
+                    browser_control_transport_family=run.browser_control_transport_family)
+                if session_tokens:
+                    resets.append((
+                        session_tokens, clear_session_vars, _clear_session_vars_unconditionally,
+                    ))
+                if run.agent_kwargs["room_dispatch"] is not None:
+                    policy = RoomExecutionPolicy.from_mapping(run.agent_kwargs["room_execution_policy"] or {})
+                    resets.append((
+                        bind_room_execution_policy(policy), reset_room_execution_policy,
+                        _clear_room_execution_policy_unconditionally,
+                    ))
+                register_gateway_notify(run.approval_session_key, approval_notify)
+                # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
+                # so stop/cancel reaps only the background processes this run created.
+                _api_server._publish_turn_process_ownership(agent, effective_task_id)
+                r = agent.run_conversation(
+                    user_message=run.user_message, conversation_history=run.conversation_history,
+                    task_id=effective_task_id)
             finally:
-                for token, reset in resets:
-                    with suppress(Exception):
+                cleanup_error = None
+                cleanup_actions = [
+                    lambda: _api_server._clear_turn_process_ownership(agent),
+                    lambda: (
+                        self._bind_declared_conversation(
+                            getattr(agent, "session_id", None) or session_id, run.gateway_session_key)
+                        if run.declared_selected else None),
+                    lambda: unregister_gateway_notify(run.approval_session_key),
+                ]
+                for cleanup in cleanup_actions:
+                    try:
+                        cleanup()
+                    except BaseException as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                for token, reset, fail_safe_clear in reversed(resets):
+                    try:
                         reset(token)
+                    except BaseException as exc:
+                        with suppress(BaseException):
+                            fail_safe_clear()
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                if cleanup_error is not None:
+                    raise cleanup_error
+        finally:
+            _api_server._reset_contextvars_fail_safe(
+                (_api_server._api_request_auth_context, auth_token))
         return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
 
 
@@ -566,6 +764,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
+        if run.credential_session_lease_holder:
+            agent._preacquired_session_turn_lease_holder = run.credential_session_lease_holder
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage = await loop.run_in_executor(
@@ -580,7 +780,16 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         else:
             # Undelivered steer text rides on the terminal event/status for client replay.
             extra = {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {}
-            _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
+            candidate_session_id = getattr(agent, "session_id", None)
+            effective_session_id = (
+                candidate_session_id
+                if isinstance(candidate_session_id, str) and candidate_session_id
+                else run.session_id
+            )
+            _finish(
+                "completed", extra, output=result.get("final_response", ""), usage=usage,
+                session_id=effective_session_id,
+            )
     except asyncio.CancelledError:
         _finish("cancelled")
         raise
@@ -597,6 +806,13 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         _unregister_approval_notify(run.approval_session_key)
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
+        if run.credential_session_lease_refresh_handle is not None:
+            with suppress(Exception):
+                run.credential_session_lease_refresh_handle.cancel(wait=1.0)
+        if run.credential_session_lease_holder and run.session_db is not None:
+            with suppress(Exception):
+                run.session_db.release_session_turn_lease(
+                    run.session_id, run.credential_session_lease_holder)
         _retire_live_run(self, run_id)
 
 

@@ -575,6 +575,8 @@ class TestRunsHandlerPrecedence:
         seen = []
         self._capture_agent(adapter, seen)
         _seed(db, "sess-live", key=KEY)
+        # Canonical continuation requires an existing session, independent of KEY.
+        db.create_session(session_id="explicit-session", source=SOURCE, model="m")
 
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
